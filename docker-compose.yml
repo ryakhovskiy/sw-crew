@@ -1,0 +1,23 @@
+services:
+  crew:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - crew-workspace:/app/workspace
+      - crew-db:/app/db
+      - crew-logs:/app/logs
+    configs:
+      - source: crew_config
+        target: /app/config.yaml
+
+configs:
+  crew_config:
+    file: ./config.yaml
+
+volumes:
+  crew-workspace:
+  crew-db:
+  crew-logs:

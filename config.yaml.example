@@ -1,0 +1,20 @@
+# AI Dev Crew Configuration
+# Copy to config.yaml and adjust non-secret settings.
+# Secrets (API keys, tokens) go in .env — see .env.example.
+
+gateway:
+  host: "127.0.0.1"   # use "0.0.0.0" inside Docker
+  port: 8080
+
+workspace_root: "workspace"
+repo_root: ""
+
+model: "claude-sonnet-4-20250514"
+coverage_threshold: 80
+max_debug_attempts: 5
+max_tool_calls: 20
+
+tools:
+  linter: "ruff"
+  test_runner: "pytest"
+  security_scanner: "bandit"

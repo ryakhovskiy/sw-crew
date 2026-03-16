@@ -191,6 +191,13 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# AI Dev Crew runtime
+workspace/
+db/
+logs/
+chroma/
+config.yaml
+
 # PyPI configuration file
 .pypirc
 

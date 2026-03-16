@@ -1,15 +1,10 @@
 """Orchestrator — central coordinator and pipeline state machine.
 
-Phase 1 simplified flow:
-    INTAKE → BUILD → TEST_LOOP → DONE
+Full pipeline:
+    INTAKE → ANALYSIS → [spec gate] → ARCHITECTURE → [arch gate]
+    → PLANNING → BUILD → REVIEW → TEST_LOOP → [deploy gate] → DEPLOY → DONE
 
-Phase 2 adds:
-    INTAKE → ANALYSIS → [gate] → ARCHITECTURE → [gate]
-    → PLANNING → BUILD → REVIEW → TEST_LOOP → [gate] → DONE
-
-Phase 3 adds:
-    ... → TEST_LOOP → [deploy gate] → DEPLOY → DONE
-    Doc Writer runs in parallel with Coder during BUILD.
+Doc Writer runs in parallel with Coder during BUILD.
 """
 
 from __future__ import annotations
@@ -19,11 +14,15 @@ import json
 import logging
 from pathlib import Path
 
+from crew.agents.analyst import AnalystAgent
+from crew.agents.architect import ArchitectAgent
 from crew.agents.base import AgentResult
 from crew.agents.coder import CoderAgent
 from crew.agents.debugger import DebuggerAgent
 from crew.agents.deployer import DeployerAgent
 from crew.agents.docwriter import DocWriterAgent
+from crew.agents.planner import PlannerAgent
+from crew.agents.reviewer import ReviewerAgent
 from crew.agents.tester import TesterAgent
 from crew.config import Config
 from crew.db.store import TaskStore
@@ -32,7 +31,11 @@ logger = logging.getLogger(__name__)
 
 # Phase constants
 PHASE_INTAKE = "INTAKE"
+PHASE_ANALYSIS = "ANALYSIS"
+PHASE_ARCHITECTURE = "ARCHITECTURE"
+PHASE_PLANNING = "PLANNING"
 PHASE_BUILD = "BUILD"
+PHASE_REVIEW = "REVIEW"
 PHASE_TEST_LOOP = "TEST_LOOP"
 PHASE_AWAITING_GATE = "AWAITING_GATE"
 PHASE_DEPLOY = "DEPLOY"
@@ -85,8 +88,16 @@ class Orchestrator:
         match task.phase:
             case "INTAKE":
                 await self._handle_intake(task_id, task)
+            case "ANALYSIS":
+                await self._handle_analysis(task_id, task)
+            case "ARCHITECTURE":
+                await self._handle_architecture(task_id, task)
+            case "PLANNING":
+                await self._handle_planning(task_id, task)
             case "BUILD":
                 await self._handle_build(task_id, task)
+            case "REVIEW":
+                await self._handle_review(task_id, task)
             case "TEST_LOOP":
                 await self._handle_test_loop(task_id, task)
             case "DEPLOY":
@@ -119,12 +130,36 @@ class Orchestrator:
     # -- phase handlers -------------------------------------------------------
 
     async def _handle_intake(self, task_id: str, task) -> None:
-        """INTAKE → advance to BUILD and launch Coder."""
-        self.store.update_task(task_id, phase=PHASE_BUILD, status=STATUS_RUNNING)
-        self.store.push_notification(
-            task_id, "phase:change", {"phase": PHASE_BUILD}
+        """INTAKE → advance to ANALYSIS and launch Requirements Analyst."""
+        self.store.update_task(
+            task_id, phase=PHASE_ANALYSIS, status=STATUS_RUNNING
         )
-        await self._run_coder(task_id, task)
+        self.store.push_notification(
+            task_id, "phase:change", {"phase": PHASE_ANALYSIS}
+        )
+        await self._run_analyst(task_id, task)
+
+    async def _handle_analysis(self, task_id: str, task) -> None:
+        """ANALYSIS — run Requirements Analyst, then create spec approval gate."""
+        self.store.update_task(task_id, status=STATUS_RUNNING)
+        rejection = self._get_last_rejection(task_id, "spec_approval")
+        await self._run_analyst(task_id, task, rejection_reason=rejection)
+
+    async def _handle_architecture(self, task_id: str, task) -> None:
+        """ARCHITECTURE — run Architect, then create arch approval gate."""
+        self.store.update_task(task_id, status=STATUS_RUNNING)
+        rejection = self._get_last_rejection(task_id, "arch_approval")
+        await self._run_architect(task_id, task, rejection_reason=rejection)
+
+    async def _handle_planning(self, task_id: str, task) -> None:
+        """PLANNING — run Implementation Planner."""
+        self.store.update_task(task_id, status=STATUS_RUNNING)
+        await self._run_planner(task_id, task)
+
+    async def _handle_review(self, task_id: str, task) -> None:
+        """REVIEW — run Code Reviewer."""
+        self.store.update_task(task_id, status=STATUS_RUNNING)
+        await self._run_reviewer(task_id, task)
 
     async def _handle_build(self, task_id: str, task) -> None:
         """BUILD — run Coder and Doc Writer in parallel."""
@@ -132,9 +167,17 @@ class Orchestrator:
 
         task_dict = self._task_to_dict(task)
 
+        # If returning from a review block, inject review feedback into Coder context
+        review_data = self._read_json(task_id, "review.json")
+        review_feedback = None
+        if review_data and review_data.get("decision") == "block":
+            review_feedback = review_data
+
         # Launch Coder and Doc Writer concurrently.
         # Doc Writer failure is non-blocking — code still advances.
-        coder_coro = self._run_coder(task_id, task)
+        coder_coro = self._run_coder(
+            task_id, task, review_feedback=review_feedback
+        )
         docwriter_coro = self._run_docwriter(task_id, task_dict)
 
         coder_result, doc_result = await asyncio.gather(
@@ -211,6 +254,166 @@ class Orchestrator:
 
     # -- agent runners --------------------------------------------------------
 
+    async def _run_analyst(
+        self, task_id: str, task,
+        *, rejection_reason: str | None = None,
+        escalation_answer: str | None = None,
+    ) -> None:
+        """Run Requirements Analyst and create spec approval gate on success."""
+        analyst = AnalystAgent(task_id, self.config, self.store)
+        task_dict = self._task_to_dict(task)
+        if rejection_reason:
+            task_dict["rejection_reason"] = rejection_reason
+        if escalation_answer:
+            task_dict["escalation_answer"] = escalation_answer
+
+        result = await analyst.run(task_dict)
+
+        if result.escalation:
+            await self._handle_escalation(task_id, result, "analyst")
+            return
+
+        if result.success:
+            # spec.json written → create spec approval gate
+            gate_id = self.store.create_gate(
+                task_id, gate_type="spec_approval", artifact="spec.json"
+            )
+            self.store.update_task(
+                task_id, phase=PHASE_AWAITING_GATE, status=STATUS_PENDING, agent=None
+            )
+            self.store.push_notification(
+                task_id, "gate:pending", {"gate_id": gate_id, "type": "spec_approval"}
+            )
+            logger.info("Task %s: spec gate %s created", task_id, gate_id)
+        else:
+            self.store.update_task(
+                task_id, phase=PHASE_FAILED, status=STATUS_FAILED
+            )
+            self.store.push_notification(
+                task_id, "task:failed", {"reason": result.error or "Analyst failed"}
+            )
+
+    async def _run_architect(
+        self, task_id: str, task,
+        *, rejection_reason: str | None = None,
+        escalation_answer: str | None = None,
+    ) -> None:
+        """Run Architect and create arch approval gate on success."""
+        architect = ArchitectAgent(task_id, self.config, self.store)
+        task_dict = self._task_to_dict(task)
+        if rejection_reason:
+            task_dict["rejection_reason"] = rejection_reason
+        if escalation_answer:
+            task_dict["escalation_answer"] = escalation_answer
+
+        result = await architect.run(task_dict)
+
+        if result.escalation:
+            await self._handle_escalation(task_id, result, "architect")
+            return
+
+        if result.success:
+            # arch.md written → create arch approval gate
+            gate_id = self.store.create_gate(
+                task_id, gate_type="arch_approval", artifact="arch.md"
+            )
+            self.store.update_task(
+                task_id, phase=PHASE_AWAITING_GATE, status=STATUS_PENDING, agent=None
+            )
+            self.store.push_notification(
+                task_id, "gate:pending", {"gate_id": gate_id, "type": "arch_approval"}
+            )
+            logger.info("Task %s: arch gate %s created", task_id, gate_id)
+        else:
+            self.store.update_task(
+                task_id, phase=PHASE_FAILED, status=STATUS_FAILED
+            )
+            self.store.push_notification(
+                task_id, "task:failed", {"reason": result.error or "Architect failed"}
+            )
+
+    async def _run_planner(
+        self, task_id: str, task,
+        *, escalation_answer: str | None = None,
+    ) -> None:
+        """Run Implementation Planner, then advance to BUILD."""
+        planner = PlannerAgent(task_id, self.config, self.store)
+        task_dict = self._task_to_dict(task)
+        if escalation_answer:
+            task_dict["escalation_answer"] = escalation_answer
+
+        result = await planner.run(task_dict)
+
+        if result.escalation:
+            await self._handle_escalation(task_id, result, "planner")
+            return
+
+        if result.success:
+            self.store.update_task(
+                task_id, phase=PHASE_BUILD, status=STATUS_PENDING
+            )
+            self.store.push_notification(
+                task_id, "phase:change", {"phase": PHASE_BUILD}
+            )
+            logger.info("Task %s: plan complete, advancing to BUILD", task_id)
+        else:
+            self.store.update_task(
+                task_id, phase=PHASE_FAILED, status=STATUS_FAILED
+            )
+            self.store.push_notification(
+                task_id, "task:failed", {"reason": result.error or "Planner failed"}
+            )
+
+    async def _run_reviewer(
+        self, task_id: str, task,
+        *, escalation_answer: str | None = None,
+    ) -> None:
+        """Run Code Reviewer. Block → re-run Coder; pass → advance to TEST_LOOP."""
+        reviewer = ReviewerAgent(task_id, self.config, self.store)
+        task_dict = self._task_to_dict(task)
+        if escalation_answer:
+            task_dict["escalation_answer"] = escalation_answer
+
+        result = await reviewer.run(task_dict)
+
+        if result.escalation:
+            await self._handle_escalation(task_id, result, "reviewer")
+            return
+
+        if not result.success:
+            self.store.update_task(
+                task_id, phase=PHASE_FAILED, status=STATUS_FAILED
+            )
+            self.store.push_notification(
+                task_id, "task:failed", {"reason": result.error or "Reviewer failed"}
+            )
+            return
+
+        # Check review decision
+        review = self._read_json(task_id, "review.json")
+        if review and review.get("decision") == "block":
+            # Critical issues found → route back to Coder with review feedback
+            logger.info(
+                "Task %s: review blocked, routing back to Coder", task_id
+            )
+            self.store.update_task(
+                task_id, phase=PHASE_BUILD, status=STATUS_PENDING
+            )
+            self.store.push_notification(
+                task_id, "phase:change", {"phase": PHASE_BUILD}
+            )
+            return
+
+        # Review passed → advance to TEST_LOOP
+        self.store.update_task(
+            task_id, phase=PHASE_TEST_LOOP, status=STATUS_PENDING,
+            debug_attempts=0
+        )
+        self.store.push_notification(
+            task_id, "phase:change", {"phase": PHASE_TEST_LOOP}
+        )
+        logger.info("Task %s: review passed, advancing to TEST_LOOP", task_id)
+
     async def _run_coder(
         self, task_id: str, task, *,
         review_feedback: dict | None = None,
@@ -233,15 +436,21 @@ class Orchestrator:
             return
 
         if result.success:
-            # Coder done → advance to TEST_LOOP
+            # Coder done → advance to REVIEW
+            # If review.json from a previous review block exists, coder
+            # was re-run with feedback — read review issues for context
+            review_data = self._read_json(task_id, "review.json")
+            if review_data and review_data.get("decision") == "block":
+                # Coder re-ran after review block; need re-review
+                pass  # will fall through to REVIEW below
             self.store.update_task(
                 task_id,
-                phase=PHASE_TEST_LOOP,
+                phase=PHASE_REVIEW,
                 status=STATUS_PENDING,
                 debug_attempts=0,
             )
             self.store.push_notification(
-                task_id, "phase:change", {"phase": PHASE_TEST_LOOP}
+                task_id, "phase:change", {"phase": PHASE_REVIEW}
             )
         else:
             self.store.update_task(
@@ -379,12 +588,76 @@ class Orchestrator:
         if not task or task.phase != PHASE_AWAITING_GATE:
             return
 
+        if gate.type == "spec_approval":
+            if gate.status == "approved":
+                # Advance to ARCHITECTURE
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_ARCHITECTURE, status=STATUS_PENDING
+                )
+                self.store.push_notification(
+                    gate.task_id, "phase:change", {"phase": PHASE_ARCHITECTURE}
+                )
+                logger.info(
+                    "Task %s: spec approved, advancing to ARCHITECTURE",
+                    gate.task_id,
+                )
+            elif gate.status == "rejected":
+                # Re-run Analyst with rejection feedback
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_ANALYSIS, status=STATUS_PENDING
+                )
+                logger.info(
+                    "Task %s: spec rejected, re-running Analyst",
+                    gate.task_id,
+                )
+            return
+
+        if gate.type == "arch_approval":
+            if gate.status == "approved":
+                # Advance to PLANNING
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_PLANNING, status=STATUS_PENDING
+                )
+                self.store.push_notification(
+                    gate.task_id, "phase:change", {"phase": PHASE_PLANNING}
+                )
+                logger.info(
+                    "Task %s: arch approved, advancing to PLANNING",
+                    gate.task_id,
+                )
+            elif gate.status == "rejected":
+                # Re-run Architect with rejection feedback
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_ARCHITECTURE, status=STATUS_PENDING
+                )
+                logger.info(
+                    "Task %s: arch rejected, re-running Architect",
+                    gate.task_id,
+                )
+            return
+
         if gate.type == "escalation" and gate.status == "answered":
             # Resume the waiting agent with the answer
             previous_agent = task.agent
-            if previous_agent == "coder":
+            if previous_agent == "analyst":
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_ANALYSIS, status=STATUS_PENDING
+                )
+            elif previous_agent == "architect":
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_ARCHITECTURE, status=STATUS_PENDING
+                )
+            elif previous_agent == "planner":
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_PLANNING, status=STATUS_PENDING
+                )
+            elif previous_agent == "coder":
                 self.store.update_task(
                     gate.task_id, phase=PHASE_BUILD, status=STATUS_PENDING
+                )
+            elif previous_agent == "reviewer":
+                self.store.update_task(
+                    gate.task_id, phase=PHASE_REVIEW, status=STATUS_PENDING
                 )
             elif previous_agent in ("tester", "debugger"):
                 self.store.update_task(
@@ -414,6 +687,18 @@ class Orchestrator:
                 logger.info("Task %s: deploy rejected, reverting to TEST_LOOP", gate.task_id)
 
     # -- helpers --------------------------------------------------------------
+
+    def _get_last_rejection(self, task_id: str, gate_type: str) -> str | None:
+        """Return the rejection reason from the most recent rejected gate of the given type."""
+        gates = self.store.list_gates()
+        rejected = [
+            g for g in gates
+            if g.task_id == task_id and g.type == gate_type and g.status == "rejected"
+        ]
+        if rejected:
+            # Gates are ordered by created_at ASC; take the last one
+            return rejected[-1].reason
+        return None
 
     def _task_to_dict(self, task) -> dict:
         return {

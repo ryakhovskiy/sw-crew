@@ -9,9 +9,19 @@ services:
       - crew-workspace:/app/workspace
       - crew-db:/app/db
       - crew-logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
     configs:
       - source: crew_config
         target: /app/config.yaml
+
+  # Build the agent image for Docker sandboxing
+  crew-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: crew-agent:latest
+    profiles:
+      - build-only
 
 configs:
   crew_config:

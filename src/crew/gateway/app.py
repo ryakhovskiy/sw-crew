@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from crew.agents.orchestrator import Orchestrator
 from crew.config import Config, load_config
 from crew.db.migrate import run_migrations
 from crew.db.store import TaskStore
-from crew.gateway.routes import gates, health, stream, tasks
+from crew.gateway.routes import gates, health, metrics, stream, tasks
 from crew.logging import setup_root_logging
 from crew.notifications import SQLiteNotificationBus
 
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
     orch_task = asyncio.create_task(orchestrator.run_forever())
 
     logger.info("Gateway started — listening on %s:%d", config.gateway.host, config.gateway.port)
+    app.state.startup_time = time.time()
     yield
 
     # Shutdown
@@ -70,6 +72,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(gates.router)
     app.include_router(health.router)
     app.include_router(stream.router)
+    app.include_router(metrics.router)
 
     # Serve React SPA static files if the build directory exists
     static_dir = Path(__file__).parent / "static"

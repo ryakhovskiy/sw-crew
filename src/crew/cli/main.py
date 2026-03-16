@@ -111,6 +111,7 @@ def status(ctx, task_id):
             click.echo(f"Status: {data['status']}")
             click.echo(f"Agent:  {data.get('agent', '-')}")
             click.echo(f"Debug:  {data['debug_attempts']} attempts")
+            click.echo(f"Cost:   ${data.get('total_cost_usd', 0):.4f}")
             if data.get("artifacts"):
                 click.echo("Artifacts:")
                 for a in data["artifacts"]:
@@ -232,20 +233,57 @@ def artifact(ctx, task_id, name):
 # ---------------------------------------------------------------------------
 
 @cli.command()
+@click.option("--search", "-s", default=None, help="Filter by title/body substring")
+@click.option("--since", default=None, help="Filter by creation date (YYYY-MM-DD)")
+@click.option("--status", "filter_status", default=None, help="Filter by status (done|failed)")
+@click.option(
+    "--sort", default="date",
+    type=click.Choice(["date", "cost", "duration"]),
+    help="Sort order",
+)
 @click.pass_context
-def history(ctx):
+def history(ctx, search, since, filter_status, sort):
     """Show completed and failed tasks."""
+    import datetime
+
     with _client(ctx.obj["config"]) as c:
-        resp = c.get("/tasks")
+        params: dict = {}
+        if search:
+            params["q"] = search
+        if since:
+            try:
+                dt = datetime.datetime.strptime(since, "%Y-%m-%d")
+                params["since"] = int(dt.timestamp())
+            except ValueError:
+                click.echo("Invalid date format. Use YYYY-MM-DD.", err=True)
+                raise SystemExit(1) from None
+        if filter_status:
+            params["status"] = filter_status
+
+        sort_map = {"date": "created_at", "cost": "total_cost_usd", "duration": "updated_at"}
+        params["sort"] = sort_map.get(sort, "created_at")
+        params["order"] = "desc"
+
+        # Use search endpoint if filters present, else plain list
+        endpoint = "/tasks/search" if params else "/tasks"
+        resp = c.get(endpoint, params=params if params else None)
         resp.raise_for_status()
         tasks = resp.json()
-        done = [t for t in tasks if t["status"] in ("done", "failed")]
-        if not done:
+
+        # Filter to done/failed if not already filtered by status
+        if not filter_status:
+            tasks = [t for t in tasks if t["status"] in ("done", "failed")]
+
+        if not tasks:
             click.echo("No completed tasks.")
             return
-        for t in done:
+        for t in tasks:
+            cost = t.get("total_cost_usd", 0)
+            duration = t.get("updated_at", 0) - t.get("created_at", 0)
+            dur_str = f"{duration // 60}m{duration % 60:02d}s" if duration else "-"
             click.echo(
-                f"  {t['id']}  {t['status']:10s}  {t['title'][:50]}"
+                f"  {t['id']}  {t['status']:10s}  ${cost:.4f}  {dur_str:>8s}  "
+                f"{t['title'][:40]}"
             )
 
 

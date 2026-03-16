@@ -19,8 +19,10 @@ from typing import Any
 import anthropic
 
 from crew.config import Config
+from crew.context import estimate_tokens, summarize_history
 from crew.db.store import TaskStore
 from crew.logging import get_agent_logger
+from crew.resilience import CircuitBreaker, CircuitOpenError, RetryPolicy
 from crew.tools import files as file_tools
 from crew.tools import git as git_tools
 from crew.tools import search as search_tools
@@ -40,6 +42,7 @@ class AgentResult:
     escalation: dict | None = None
     error: str | None = None
     token_usage: dict = field(default_factory=dict)
+    cost_usd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +195,14 @@ class BaseAgent(ABC):
     # Subclasses should set these
     agent_name: str = "base"
 
-    def __init__(self, task_id: str, config: Config, store: TaskStore) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        config: Config,
+        store: TaskStore,
+        *,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
         self.task_id = task_id
         self.config = config
         self.store = store
@@ -201,6 +211,11 @@ class BaseAgent(ABC):
         self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         self._total_input_tokens = 0
         self._total_output_tokens = 0
+        self._retry_policy = RetryPolicy(
+            max_retries=config.max_agent_retries,
+            backoff_base=config.retry_backoff_base,
+        )
+        self._circuit_breaker = circuit_breaker
         # Per-agent structured log file: logs/{task_id}/{agent_name}.jsonl
         self._agent_logger = get_agent_logger("logs", task_id, self.agent_name)
 
@@ -234,21 +249,47 @@ class BaseAgent(ABC):
         self.store.update_task(self.task_id, agent=self.agent_name, status="running")
         git_tools.ensure_repo(self.workspace)
 
+        # Circuit breaker check — fail fast if circuit is open
+        if self._circuit_breaker:
+            try:
+                self._circuit_breaker.check()
+            except CircuitOpenError as exc:
+                logger.error("[%s] %s", self.task_id, exc)
+                return AgentResult(success=False, error=str(exc))
+
         for iteration in range(self.config.max_tool_calls):
             logger.info(
                 "[%s] agent=%s iteration=%d", self.task_id, self.agent_name, iteration
             )
 
+            # Context window management — summarize if approaching budget
+            budget = self.config.context_budget_tokens
+            trigger = int(budget * self.config.summarization_trigger_pct)
+            estimated = estimate_tokens(messages)
+            if estimated > trigger and len(messages) > 4:
+                logger.info(
+                    "[%s] Context ~%d tokens exceeds trigger %d, summarizing",
+                    self.task_id, estimated, trigger,
+                )
+                messages = summarize_history(
+                    self._client, messages, self.config.model
+                )
+
             try:
-                response = self._client.messages.create(
+                response = await self._retry_policy.execute(
+                    self._client.messages.create,
                     model=self.config.model,
                     max_tokens=16384,
                     system=system_prompt,
                     messages=messages,
                     tools=tools,
                 )
+                if self._circuit_breaker:
+                    self._circuit_breaker.record_success()
             except anthropic.APIError as exc:
                 logger.error("[%s] Anthropic API error: %s", self.task_id, exc)
+                if self._circuit_breaker:
+                    self._circuit_breaker.record_failure()
                 return AgentResult(success=False, error=str(exc))
 
             self._total_input_tokens += response.usage.input_tokens
@@ -310,6 +351,13 @@ class BaseAgent(ABC):
             "output_tokens": self._total_output_tokens,
         }
 
+        # Compute cost based on pricing config
+        pricing = self.config.pricing
+        cost_usd = (
+            self._total_input_tokens * pricing.input_per_1m_usd
+            + self._total_output_tokens * pricing.output_per_1m_usd
+        ) / 1_000_000
+
         if escalation:
             self.store.append_audit(
                 self.task_id, self.agent_name, "agent:escalation",
@@ -321,12 +369,14 @@ class BaseAgent(ABC):
                     "task_id": self.task_id,
                     "agent": self.agent_name,
                     "token_usage": token_usage,
+                    "cost_usd": cost_usd,
                 },
             )
             return AgentResult(
                 success=False,
                 escalation=escalation,
                 token_usage=token_usage,
+                cost_usd=cost_usd,
             )
 
         output_file = self.get_output_file()
@@ -348,7 +398,7 @@ class BaseAgent(ABC):
 
         self.store.append_audit(
             self.task_id, self.agent_name, "agent:completed",
-            {"output_file": output_file, **token_usage}
+            {"output_file": output_file, "cost_usd": cost_usd, **token_usage}
         )
         self._agent_logger.info(
             "Agent completed",
@@ -356,12 +406,14 @@ class BaseAgent(ABC):
                 "task_id": self.task_id,
                 "agent": self.agent_name,
                 "token_usage": token_usage,
+                "cost_usd": cost_usd,
             },
         )
         return AgentResult(
             success=True,
             output_file=output_file,
             token_usage=token_usage,
+            cost_usd=cost_usd,
         )
 
     # -- tool dispatch --------------------------------------------------------

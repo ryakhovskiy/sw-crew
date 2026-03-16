@@ -52,12 +52,13 @@ export default function Dashboard() {
               <th>Title</th>
               <th>Phase</th>
               <th>Status</th>
+              <th>Cost</th>
               <th>Agent</th>
             </tr>
           </thead>
           <tbody>
             {tasks.length === 0 && (
-              <tr><td colSpan={5} style={{ color: 'var(--text-muted)', textAlign: 'center' }}>No tasks yet</td></tr>
+              <tr><td colSpan={6} style={{ color: 'var(--text-muted)', textAlign: 'center' }}>No tasks yet</td></tr>
             )}
             {tasks.map(t => (
               <tr key={t.id}>
@@ -65,6 +66,7 @@ export default function Dashboard() {
                 <td>{t.title.slice(0, 60)}</td>
                 <td><span className="badge badge-info">{t.phase}</span></td>
                 <td>{statusBadge(t.status)}</td>
+                <td style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>${t.total_cost_usd?.toFixed(4) ?? '0.0000'}</td>
                 <td style={{ color: 'var(--text-muted)' }}>{t.agent || '-'}</td>
               </tr>
             ))}

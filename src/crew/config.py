@@ -25,6 +25,22 @@ class ToolsConfig:
 
 
 @dataclass
+class PricingConfig:
+    input_per_1m_usd: float = 3.0
+    output_per_1m_usd: float = 15.0
+
+
+@dataclass
+class DockerSandboxConfig:
+    enabled: bool = False
+    image: str = "crew-agent:latest"
+    memory_limit: str = "512m"
+    cpu_limit: float = 1.0
+    network_mode: str = "none"
+    timeout: int = 600
+
+
+@dataclass
 class Config:
     anthropic_api_key: str = ""
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
@@ -36,6 +52,18 @@ class Config:
     max_debug_attempts: int = 5
     max_tool_calls: int = 20
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    # Retry + circuit breaker
+    max_agent_retries: int = 3
+    retry_backoff_base: float = 2.0
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_reset_seconds: int = 300
+    # Cost tracking
+    pricing: PricingConfig = field(default_factory=PricingConfig)
+    # Context window management
+    context_budget_tokens: int = 150_000
+    summarization_trigger_pct: float = 0.8
+    # Docker sandboxing
+    docker_sandbox: DockerSandboxConfig = field(default_factory=DockerSandboxConfig)
 
     def ensure_dirs(self) -> None:
         """Create runtime directories if they don't exist."""
@@ -80,6 +108,26 @@ def load_config(path: str | Path | None = None) -> Config:
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", raw.get("anthropic_api_key", ""))
 
+    pricing_raw = raw.get("pricing", {})
+    pricing = PricingConfig(
+        input_per_1m_usd=float(
+            pricing_raw.get("input_per_1m_usd", PricingConfig.input_per_1m_usd)
+        ),
+        output_per_1m_usd=float(
+            pricing_raw.get("output_per_1m_usd", PricingConfig.output_per_1m_usd)
+        ),
+    )
+
+    docker_raw = raw.get("docker_sandbox", {})
+    docker_sandbox = DockerSandboxConfig(
+        enabled=bool(docker_raw.get("enabled", DockerSandboxConfig.enabled)),
+        image=docker_raw.get("image", DockerSandboxConfig.image),
+        memory_limit=docker_raw.get("memory_limit", DockerSandboxConfig.memory_limit),
+        cpu_limit=float(docker_raw.get("cpu_limit", DockerSandboxConfig.cpu_limit)),
+        network_mode=docker_raw.get("network_mode", DockerSandboxConfig.network_mode),
+        timeout=int(docker_raw.get("timeout", DockerSandboxConfig.timeout)),
+    )
+
     config = Config(
         anthropic_api_key=api_key,
         gateway=gateway,
@@ -91,5 +139,21 @@ def load_config(path: str | Path | None = None) -> Config:
         max_debug_attempts=int(raw.get("max_debug_attempts", Config.max_debug_attempts)),
         max_tool_calls=int(raw.get("max_tool_calls", Config.max_tool_calls)),
         tools=tools,
+        max_agent_retries=int(raw.get("max_agent_retries", Config.max_agent_retries)),
+        retry_backoff_base=float(raw.get("retry_backoff_base", Config.retry_backoff_base)),
+        circuit_breaker_threshold=int(
+            raw.get("circuit_breaker_threshold", Config.circuit_breaker_threshold)
+        ),
+        circuit_breaker_reset_seconds=int(
+            raw.get("circuit_breaker_reset_seconds", Config.circuit_breaker_reset_seconds)
+        ),
+        pricing=pricing,
+        context_budget_tokens=int(
+            raw.get("context_budget_tokens", Config.context_budget_tokens)
+        ),
+        summarization_trigger_pct=float(
+            raw.get("summarization_trigger_pct", Config.summarization_trigger_pct)
+        ),
+        docker_sandbox=docker_sandbox,
     )
     return config

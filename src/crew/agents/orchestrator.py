@@ -26,6 +26,7 @@ from crew.agents.reviewer import ReviewerAgent
 from crew.agents.tester import TesterAgent
 from crew.config import Config
 from crew.db.store import TaskStore
+from crew.resilience import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +57,47 @@ class Orchestrator:
         self.config = config
         self.store = store
         self._running = False
+        # Per-agent circuit breakers
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        # Docker sandbox runner (lazy init)
+        self._docker_runner = None
+
+    def _get_circuit_breaker(self, agent_name: str) -> CircuitBreaker:
+        """Return (or create) the circuit breaker for a given agent name."""
+        if agent_name not in self._circuit_breakers:
+            self._circuit_breakers[agent_name] = CircuitBreaker(
+                threshold=self.config.circuit_breaker_threshold,
+                reset_seconds=self.config.circuit_breaker_reset_seconds,
+            )
+        return self._circuit_breakers[agent_name]
+
+    async def _run_agent_docker(self, agent_name: str, task_id: str) -> AgentResult | None:
+        """Run an agent via Docker if sandboxing is enabled. Returns None if disabled."""
+        if not self.config.docker_sandbox.enabled:
+            return None
+        if self._docker_runner is None:
+            from crew.sandbox import DockerAgentRunner
+            self._docker_runner = DockerAgentRunner(self.config)
+        return await self._docker_runner.run_agent(agent_name, task_id)
 
     # -- public interface -----------------------------------------------------
 
     async def run_forever(self, poll_interval: float = 2.0) -> None:
         """Main event loop — poll for actionable tasks and drive them."""
         self._running = True
+        self._consecutive_tick_errors = 0
         logger.info("Orchestrator started")
         while self._running:
             try:
                 await self._tick()
+                self._consecutive_tick_errors = 0
             except Exception:
+                self._consecutive_tick_errors += 1
                 logger.exception("Orchestrator tick error")
+                # Exponential backoff on persistent errors (cap at 60s)
+                backoff = min(2.0 ** self._consecutive_tick_errors, 60.0)
+                await asyncio.sleep(backoff)
+                continue
             await asyncio.sleep(poll_interval)
 
     def stop(self) -> None:
@@ -197,9 +227,13 @@ class Orchestrator:
         self.store.update_task(task_id, status=STATUS_RUNNING)
 
         # Run Tester
-        tester = TesterAgent(task_id, self.config, self.store)
+        tester = TesterAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("tester"),
+        )
         task_dict = self._task_to_dict(task)
         result = await tester.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "tester")
@@ -228,16 +262,24 @@ class Orchestrator:
             return
 
         # Run Debugger
-        debugger = DebuggerAgent(task_id, self.config, self.store)
+        debugger = DebuggerAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("debugger"),
+        )
         debug_result = await debugger.run(task_dict)
+        self._accumulate_cost(task_id, debug_result)
 
         if debug_result.escalation:
             await self._handle_escalation(task_id, debug_result, "debugger")
             return
 
         # Re-run Tester to verify fixes (don't read stale report)
-        tester2 = TesterAgent(task_id, self.config, self.store)
+        tester2 = TesterAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("tester"),
+        )
         result2 = await tester2.run(task_dict)
+        self._accumulate_cost(task_id, result2)
 
         if result2.escalation:
             await self._handle_escalation(task_id, result2, "tester")
@@ -260,7 +302,10 @@ class Orchestrator:
         escalation_answer: str | None = None,
     ) -> None:
         """Run Requirements Analyst and create spec approval gate on success."""
-        analyst = AnalystAgent(task_id, self.config, self.store)
+        analyst = AnalystAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("analyst"),
+        )
         task_dict = self._task_to_dict(task)
         if rejection_reason:
             task_dict["rejection_reason"] = rejection_reason
@@ -268,6 +313,7 @@ class Orchestrator:
             task_dict["escalation_answer"] = escalation_answer
 
         result = await analyst.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "analyst")
@@ -299,7 +345,10 @@ class Orchestrator:
         escalation_answer: str | None = None,
     ) -> None:
         """Run Architect and create arch approval gate on success."""
-        architect = ArchitectAgent(task_id, self.config, self.store)
+        architect = ArchitectAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("architect"),
+        )
         task_dict = self._task_to_dict(task)
         if rejection_reason:
             task_dict["rejection_reason"] = rejection_reason
@@ -307,6 +356,7 @@ class Orchestrator:
             task_dict["escalation_answer"] = escalation_answer
 
         result = await architect.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "architect")
@@ -337,12 +387,16 @@ class Orchestrator:
         *, escalation_answer: str | None = None,
     ) -> None:
         """Run Implementation Planner, then advance to BUILD."""
-        planner = PlannerAgent(task_id, self.config, self.store)
+        planner = PlannerAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("planner"),
+        )
         task_dict = self._task_to_dict(task)
         if escalation_answer:
             task_dict["escalation_answer"] = escalation_answer
 
         result = await planner.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "planner")
@@ -369,12 +423,16 @@ class Orchestrator:
         *, escalation_answer: str | None = None,
     ) -> None:
         """Run Code Reviewer. Block → re-run Coder; pass → advance to TEST_LOOP."""
-        reviewer = ReviewerAgent(task_id, self.config, self.store)
+        reviewer = ReviewerAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("reviewer"),
+        )
         task_dict = self._task_to_dict(task)
         if escalation_answer:
             task_dict["escalation_answer"] = escalation_answer
 
         result = await reviewer.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "reviewer")
@@ -420,7 +478,10 @@ class Orchestrator:
         debug_context: dict | None = None,
         escalation_answer: str | None = None,
     ) -> None:
-        coder = CoderAgent(task_id, self.config, self.store)
+        coder = CoderAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("coder"),
+        )
         task_dict = self._task_to_dict(task)
         if review_feedback:
             task_dict["review_feedback"] = review_feedback
@@ -430,6 +491,7 @@ class Orchestrator:
             task_dict["escalation_answer"] = escalation_answer
 
         result = await coder.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "coder")
@@ -462,8 +524,12 @@ class Orchestrator:
 
     async def _run_docwriter(self, task_id: str, task_dict: dict) -> None:
         """Run Doc Writer agent.  Failures are non-blocking."""
-        docwriter = DocWriterAgent(task_id, self.config, self.store)
+        docwriter = DocWriterAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("docwriter"),
+        )
         result = await docwriter.run(task_dict)
+        self._accumulate_cost(task_id, result)
         if result.escalation:
             logger.info(
                 "Task %s: Doc Writer escalated (non-blocking): %s",
@@ -527,9 +593,13 @@ class Orchestrator:
         """DEPLOY — run Deployer agent."""
         self.store.update_task(task_id, status=STATUS_RUNNING)
 
-        deployer = DeployerAgent(task_id, self.config, self.store)
+        deployer = DeployerAgent(
+            task_id, self.config, self.store,
+            circuit_breaker=self._get_circuit_breaker("deployer"),
+        )
         task_dict = self._task_to_dict(task)
         result = await deployer.run(task_dict)
+        self._accumulate_cost(task_id, result)
 
         if result.escalation:
             await self._handle_escalation(task_id, result, "deployer")
@@ -687,6 +757,14 @@ class Orchestrator:
                 logger.info("Task %s: deploy rejected, reverting to TEST_LOOP", gate.task_id)
 
     # -- helpers --------------------------------------------------------------
+
+    def _accumulate_cost(self, task_id: str, result: AgentResult) -> None:
+        """Add the agent's cost to the task's total."""
+        if result.cost_usd > 0:
+            task = self.store.get_task(task_id)
+            if task:
+                new_total = task.total_cost_usd + result.cost_usd
+                self.store.update_task(task_id, total_cost_usd=new_total)
 
     def _get_last_rejection(self, task_id: str, gate_type: str) -> str | None:
         """Return the rejection reason from the most recent rejected gate of the given type."""

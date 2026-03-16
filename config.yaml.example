@@ -14,6 +14,30 @@ coverage_threshold: 80
 max_debug_attempts: 5
 max_tool_calls: 20
 
+# Retry + circuit breaker (Phase 4)
+max_agent_retries: 3
+retry_backoff_base: 2.0
+circuit_breaker_threshold: 5
+circuit_breaker_reset_seconds: 300
+
+# Context window management (Phase 4)
+context_budget_tokens: 150000
+summarization_trigger_pct: 0.8
+
+# Cost tracking pricing (Phase 4)
+pricing:
+  input_per_1m_usd: 3.0
+  output_per_1m_usd: 15.0
+
+# Docker sandboxing (Phase 4)
+docker_sandbox:
+  enabled: false
+  image: "crew-agent:latest"
+  memory_limit: "512m"
+  cpu_limit: 1.0
+  network_mode: "none"
+  timeout: 600
+
 tools:
   linter: "ruff"
   test_runner: "pytest"

@@ -82,7 +82,7 @@ export default function TaskDetail() {
       <div className="card">
         <h2>Details</h2>
         <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-          Agent: {task.agent || 'none'} &middot; Debug attempts: {task.debug_attempts}
+          Agent: {task.agent || 'none'} &middot; Debug attempts: {task.debug_attempts} &middot; Cost: ${task.total_cost_usd?.toFixed(4) ?? '0.0000'}
         </p>
         <pre style={{ whiteSpace: 'pre-wrap', marginTop: 8, fontSize: '0.9rem' }}>
           {task.body}

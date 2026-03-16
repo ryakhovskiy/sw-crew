@@ -51,6 +51,7 @@ async def list_tasks(request: Request, status: str | None = None):
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "debug_attempts": t.debug_attempts,
+            "total_cost_usd": t.total_cost_usd,
         }
         for t in tasks
     ]
@@ -77,6 +78,7 @@ async def get_task(task_id: str, request: Request):
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "debug_attempts": task.debug_attempts,
+        "total_cost_usd": task.total_cost_usd,
         "artifacts": [
             {"name": a.name, "path": a.path, "created_at": a.created_at}
             for a in artifacts
@@ -96,6 +98,38 @@ async def get_task(task_id: str, request: Request):
             for g in task_gates
         ],
     }
+
+
+@router.get("/tasks/search")
+async def search_tasks(
+    request: Request,
+    q: str | None = None,
+    status: str | None = None,
+    phase: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    sort: str = "created_at",
+    order: str = "desc",
+):
+    store = request.app.state.store
+    tasks = store.search_tasks(
+        q=q, status=status, phase=phase,
+        since=since, until=until, sort=sort, order=order,
+    )
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "phase": t.phase,
+            "status": t.status,
+            "agent": t.agent,
+            "created_at": t.created_at,
+            "updated_at": t.updated_at,
+            "debug_attempts": t.debug_attempts,
+            "total_cost_usd": t.total_cost_usd,
+        }
+        for t in tasks
+    ]
 
 
 @router.get("/tasks/{task_id}/artifacts/{name}")

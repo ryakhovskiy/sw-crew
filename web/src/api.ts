@@ -27,6 +27,7 @@ export interface Task {
   created_at: number;
   updated_at: number;
   debug_attempts: number;
+  total_cost_usd: number;
 }
 
 export interface TaskDetail extends Task {
@@ -54,6 +55,13 @@ export interface HealthStatus {
   gateway: boolean;
   orchestrator: boolean;
   database: boolean;
+  queue_depth: number;
+  active_agents: string[];
+  circuit_breakers: Record<string, string>;
+  total_cost_usd: number;
+  tasks_completed: number;
+  tasks_failed: number;
+  uptime_seconds: number;
 }
 
 // --- API methods ---
@@ -101,4 +109,12 @@ export const api = {
     }),
 
   health: () => request<HealthStatus>('/health'),
+
+  taskCosts: (taskId: string) =>
+    request<{ task_id: string; total_usd: number; agents: { agent: string; input_tokens: number; output_tokens: number; cost_usd: number }[] }>(`/tasks/${taskId}/costs`),
+
+  searchTasks: (params: Record<string, string>) => {
+    const qs = new URLSearchParams(params).toString();
+    return request<Task[]>(`/tasks/search?${qs}`);
+  },
 };

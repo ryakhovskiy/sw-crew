@@ -1,0 +1,31 @@
+# Lightweight agent image for Docker sandboxing
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install git (needed by GitPython at runtime)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir .
+
+# Copy source code
+COPY src/ src/
+RUN pip install --no-cache-dir .
+
+# Create runtime directories
+RUN mkdir -p workspace db logs
+
+# Non-root user
+RUN groupadd -r crew && useradd -r -g crew -d /app crew && \
+    chown -R crew:crew /app
+USER crew
+
+# Default: run a single agent via run_single entry point
+ENTRYPOINT ["python", "-m", "crew.agents.run_single"]

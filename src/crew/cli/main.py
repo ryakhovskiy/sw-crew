@@ -250,6 +250,39 @@ def history(ctx):
 
 
 # ---------------------------------------------------------------------------
+# log (SSE tail)
+# ---------------------------------------------------------------------------
+
+@cli.command(name="log")
+@click.argument("task_id")
+@click.pass_context
+def log_cmd(ctx, task_id):
+    """Tail live agent output for a task (Ctrl+C to stop)."""
+    config = ctx.obj["config"]
+    url = f"{config['gateway_url']}/stream/{task_id}"
+    headers = {"Authorization": f"Bearer {config['token']}"}
+
+    click.echo(f"Streaming events for {task_id} (Ctrl+C to stop)...")
+    try:
+        with httpx.stream("GET", url, headers=headers, timeout=None) as resp:
+            resp.raise_for_status()
+            event_type = ""
+            for line in resp.iter_lines():
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    data = line[5:].strip()
+                    click.echo(f"[{event_type}] {data}")
+                    if event_type == "stream:end":
+                        return
+    except KeyboardInterrupt:
+        click.echo("\nStopped.")
+    except httpx.HTTPStatusError as exc:
+        click.echo(f"Error: {exc.response.status_code} {exc.response.text}", err=True)
+        raise SystemExit(1) from None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

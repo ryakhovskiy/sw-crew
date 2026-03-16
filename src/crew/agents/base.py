@@ -20,6 +20,7 @@ import anthropic
 
 from crew.config import Config
 from crew.db.store import TaskStore
+from crew.logging import get_agent_logger
 from crew.tools import files as file_tools
 from crew.tools import git as git_tools
 from crew.tools import search as search_tools
@@ -200,6 +201,8 @@ class BaseAgent(ABC):
         self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         self._total_input_tokens = 0
         self._total_output_tokens = 0
+        # Per-agent structured log file: logs/{task_id}/{agent_name}.jsonl
+        self._agent_logger = get_agent_logger("logs", task_id, self.agent_name)
 
     # -- abstract interface ---------------------------------------------------
 
@@ -272,6 +275,15 @@ class BaseAgent(ABC):
                 logger.info(
                     "[%s] tool_call: %s(%s)", self.task_id, tool_name, json.dumps(tool_input)[:200]
                 )
+                self._agent_logger.info(
+                    "Tool call: %s", tool_name,
+                    extra={
+                        "task_id": self.task_id,
+                        "agent": self.agent_name,
+                        "tool": tool_name,
+                        "tool_args": {k: str(v)[:200] for k, v in tool_input.items()},
+                    },
+                )
 
                 result_text, is_escalation = self._dispatch_tool(tool_name, tool_input)
                 if is_escalation:
@@ -303,6 +315,14 @@ class BaseAgent(ABC):
                 self.task_id, self.agent_name, "agent:escalation",
                 {"question": escalation.get("question")}
             )
+            self._agent_logger.info(
+                "Agent escalated",
+                extra={
+                    "task_id": self.task_id,
+                    "agent": self.agent_name,
+                    "token_usage": token_usage,
+                },
+            )
             return AgentResult(
                 success=False,
                 escalation=escalation,
@@ -313,6 +333,15 @@ class BaseAgent(ABC):
         if output_file:
             out_path = self.workspace / output_file
             if out_path.exists():
+                # Validate JSON output files
+                if output_file.endswith(".json"):
+                    try:
+                        json.loads(out_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError) as exc:
+                        logger.warning(
+                            "[%s] Output %s is not valid JSON: %s",
+                            self.task_id, output_file, exc,
+                        )
                 self.store.register_artifact(
                     self.task_id, output_file, str(out_path)
                 )
@@ -320,6 +349,14 @@ class BaseAgent(ABC):
         self.store.append_audit(
             self.task_id, self.agent_name, "agent:completed",
             {"output_file": output_file, **token_usage}
+        )
+        self._agent_logger.info(
+            "Agent completed",
+            extra={
+                "task_id": self.task_id,
+                "agent": self.agent_name,
+                "token_usage": token_usage,
+            },
         )
         return AgentResult(
             success=True,
@@ -359,7 +396,8 @@ class BaseAgent(ABC):
                     if stderr:
                         parts.append(f"STDERR:\n{stderr}")
                     parts.append(f"EXIT CODE: {rc}")
-                    return "\n".join(parts), False
+                    result = "\n".join(parts)
+                    return result, False
 
                 case "search_code":
                     chunks = search_tools.search_code(

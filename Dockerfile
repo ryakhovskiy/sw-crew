@@ -1,3 +1,12 @@
+## Stage 1: Build React Web UI
+FROM node:20-slim AS webui
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install --ignore-scripts
+COPY web/ .
+RUN npm run build
+
+## Stage 2: Python application
 FROM python:3.12-slim AS base
 
 # Prevent bytecode files and enable unbuffered output
@@ -13,6 +22,13 @@ RUN apt-get update && \
 
 # Install dependencies first (layer caching)
 COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir .
+
+# Copy source code
+COPY src/ src/
+
+# Copy built Web UI assets from Stage 1
+COPY --from=webui /src/crew/gateway/static/ src/crew/gateway/static/
 RUN pip install --no-cache-dir .
 
 # Copy source code

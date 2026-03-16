@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from crew.tools.files import PathEscapeError
+
+# Maximum bytes returned from stdout/stderr to avoid blowing the LLM context.
+_MAX_OUTPUT_BYTES = 50_000
+
+
+def _check_path_escape(cmd: str) -> None:
+    """Reject commands containing path traversal patterns."""
+    # Match '..' anywhere — including cd.., ../, ..\\ etc.
+    if re.search(r"\.\.", cmd):
+        raise PathEscapeError(f"Command contains path traversal: {cmd!r}")
+
+
+def _truncate(text: str, limit: int = _MAX_OUTPUT_BYTES) -> str:
+    if len(text) > limit:
+        return text[:limit] + f"\n... [truncated, {len(text) - limit} chars omitted]"
+    return text
 
 
 def run_bash(workspace: str | Path, cmd: str, timeout: int = 120) -> tuple[str, str, int]:
@@ -15,15 +32,14 @@ def run_bash(workspace: str | Path, cmd: str, timeout: int = 120) -> tuple[str, 
 
     Security:
     - Working directory is set to *workspace*.
-    - Commands containing obvious path-escape sequences are rejected.
+    - Commands containing path-traversal sequences (``..``) are rejected.
+    - stdout/stderr are truncated to ``_MAX_OUTPUT_BYTES``.
     """
     workspace = Path(workspace).resolve()
     if not workspace.is_dir():
         raise FileNotFoundError(f"Workspace directory does not exist: {workspace}")
 
-    # Reject blatant escape attempts in the command string
-    if ".." in cmd.split():
-        raise PathEscapeError(f"Command contains path traversal: {cmd!r}")
+    _check_path_escape(cmd)
 
     try:
         result = subprocess.run(
@@ -34,6 +50,10 @@ def run_bash(workspace: str | Path, cmd: str, timeout: int = 120) -> tuple[str, 
             text=True,
             timeout=timeout,
         )
-        return result.stdout, result.stderr, result.returncode
+        return (
+            _truncate(result.stdout),
+            _truncate(result.stderr),
+            result.returncode,
+        )
     except subprocess.TimeoutExpired:
         return "", f"Command timed out after {timeout}s", -1
